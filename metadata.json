@@ -1,0 +1,7 @@
+{
+  "name": "German Language Tutor",
+  "description": "A conversational voice application that helps you practice and learn German by speaking with an AI tutor powered by the Gemini Live API.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
