@@ -1,17 +1,43 @@
 
 import { useRef, useCallback } from 'react';
-import { GoogleGenAI, LiveSession, LiveServerMessage, Modality, Blob } from '@google/genai';
+import { GoogleGenAI, LiveSession, LiveServerMessage, Modality, Blob, FunctionDeclaration, Type } from '@google/genai';
 import { decode, encode, decodeAudioData } from '../utils/audio';
-import type { SessionState, TranscriptEntry } from '../types';
+import type { SessionState, TranscriptEntry, Correction } from '../types';
 
 interface UseGeminiLiveProps {
   onTranscriptUpdate: (newEntry: TranscriptEntry) => void;
   onStateUpdate: (newState: SessionState) => void;
+  onAudioLevelChange: (level: number) => void;
+  onCorrection: (correction: Correction) => void;
 }
 
-const SYSTEM_INSTRUCTION = `You are Klaus, a friendly and patient German language tutor. Your goal is to help the user practice conversational German. Always speak in German unless the user is struggling significantly, in which case you can provide a brief explanation in English and then switch back to German. Start the conversation by introducing yourself and asking the user how they are. Keep your responses concise and encouraging. If the user makes a mistake, gently correct them. For example, if they say 'Ich bin gut', you could respond with 'Das ist schön zu hören! Man sagt eher "Mir geht es gut". Versuchen Sie es mal.' (That's good to hear! It's more common to say "Mir geht es gut". Give it a try.).`;
+const SYSTEM_INSTRUCTION = `You are Klaus, a friendly and patient German language tutor. Your goal is to help the user practice conversational German. Always speak in German. Start the conversation by introducing yourself and asking the user how they are. Keep your responses concise and encouraging. If the user makes a grammatical mistake or could phrase something better, you MUST call the 'provideCorrection' function with the original text, the corrected text, and a brief explanation in simple German. In your spoken response, you can then say something like 'Das war fast richtig! Hier ist ein kleiner Tipp für dich.' to draw their attention to the correction. Do not include the correction details in your spoken response; use the function call for that. If the user speaks English, gently guide them back to German.`;
 
-const useGeminiLive = ({ onTranscriptUpdate, onStateUpdate }: UseGeminiLiveProps) => {
+const provideCorrectionFunctionDeclaration: FunctionDeclaration = {
+    name: 'provideCorrection',
+    description: "Provides a correction for the user's German sentence.",
+    parameters: {
+        type: Type.OBJECT,
+        properties: {
+            originalText: {
+                type: Type.STRING,
+                description: "The original, incorrect text spoken by the user.",
+            },
+            correctedText: {
+                type: Type.STRING,
+                description: "The corrected version of the text.",
+            },
+            explanation: {
+                type: Type.STRING,
+                description: "A brief explanation in German about why the correction is needed.",
+            },
+        },
+        required: ['originalText', 'correctedText', 'explanation'],
+    },
+};
+
+
+const useGeminiLive = ({ onTranscriptUpdate, onStateUpdate, onAudioLevelChange, onCorrection }: UseGeminiLiveProps) => {
   const sessionRef = useRef<LiveSession | null>(null);
   const inputAudioContextRef = useRef<AudioContext | null>(null);
   const outputAudioContextRef = useRef<AudioContext | null>(null);
@@ -39,12 +65,30 @@ const useGeminiLive = ({ onTranscriptUpdate, onStateUpdate }: UseGeminiLiveProps
             voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Puck' } },
           },
           systemInstruction: SYSTEM_INSTRUCTION,
+          tools: [{ functionDeclarations: [provideCorrectionFunctionDeclaration] }],
         },
         callbacks: {
           onopen: () => {
             onStateUpdate('CONNECTED');
           },
           onmessage: async (message: LiveServerMessage) => {
+            if (message.toolCall) {
+              for (const fc of message.toolCall.functionCalls) {
+                  if (fc.name === 'provideCorrection') {
+                      onCorrection(fc.args as Correction);
+                      sessionPromise.then(session => {
+                        session.sendToolResponse({
+                          functionResponses: {
+                              id: fc.id,
+                              name: fc.name,
+                              response: { result: 'Correction displayed.' },
+                          }
+                        });
+                      });
+                  }
+              }
+            }
+
             if (message.serverContent?.inputTranscription) {
               const { text, isFinal } = message.serverContent.inputTranscription;
               currentInputTranscriptionRef.current += text;
@@ -109,7 +153,6 @@ const useGeminiLive = ({ onTranscriptUpdate, onStateUpdate }: UseGeminiLiveProps
       sessionRef.current = await sessionPromise;
       
       // Setup audio input
-      // FIX: Address TypeScript error for webkitAudioContext.
       const AudioContext = window.AudioContext || (window as any).webkitAudioContext;
       inputAudioContextRef.current = new AudioContext({ sampleRate: 16000 });
       outputAudioContextRef.current = new AudioContext({ sampleRate: 24000 });
@@ -120,6 +163,15 @@ const useGeminiLive = ({ onTranscriptUpdate, onStateUpdate }: UseGeminiLiveProps
       
       scriptProcessorRef.current.onaudioprocess = (audioProcessingEvent) => {
         const inputData = audioProcessingEvent.inputBuffer.getChannelData(0);
+
+        // Calculate audio level (RMS) and pass it up
+        let sumSquares = 0.0;
+        for (const sample of inputData) {
+          sumSquares += sample * sample;
+        }
+        const rms = Math.sqrt(sumSquares / inputData.length);
+        onAudioLevelChange(rms);
+        
         const l = inputData.length;
         const int16 = new Int16Array(l);
         for (let i = 0; i < l; i++) {
@@ -140,7 +192,7 @@ const useGeminiLive = ({ onTranscriptUpdate, onStateUpdate }: UseGeminiLiveProps
       console.error('Failed to start session:', err);
       onStateUpdate('ERROR');
     }
-  }, [onStateUpdate, onTranscriptUpdate]);
+  }, [onStateUpdate, onTranscriptUpdate, onAudioLevelChange, onCorrection]);
 
   const endSession = useCallback(() => {
     sessionRef.current?.close();
